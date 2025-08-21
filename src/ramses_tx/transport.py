@@ -1134,12 +1134,22 @@ class MqttTransport(_FullTransport, _MqttTransportAbstractor):
         # Reset reconnect interval on successful connection
         self._current_reconnect_interval = self._reconnect_interval
 
-        # Cancel any pending reconnect task
+        # Reset connection state and cancel any pending reconnect task
+        self._connected = False  # Always reset until "online" is received
         if self._reconnect_task:
             self._reconnect_task.cancel()
             self._reconnect_task = None
 
-        self.client.subscribe(self._topic_base)  # hope to see 'online' message
+        # Always subscribe to base topic for "online" message
+        result = self.client.subscribe(self._topic_base)
+        _LOGGER.info(f"Subscribed to topic_base: {self._topic_base}, result: {result}")
+
+        # If we already know the data topic, subscribe to it as well (reconnect case)
+        if self._topic_sub:
+            result_sub = self.client.subscribe(self._topic_sub, qos=self._mqtt_qos)
+            _LOGGER.info(
+                f"Re-subscribed to topic_sub: {self._topic_sub}, result: {result_sub}"
+            )
 
     def _on_connect_fail(
         self,
@@ -1163,14 +1173,14 @@ class MqttTransport(_FullTransport, _MqttTransportAbstractor):
     ) -> None:
         _LOGGER.warning(f"MQTT disconnected: {reason_code.getName()}")
 
+        # Always reset connection state
+        was_connected = self._connected
         self._connected = False
 
         # Only attempt reconnection if we didn't deliberately disconnect
-        if not self._closing and not reason_code.is_failure:
-            # This was an unexpected disconnect, schedule reconnection
-            self._schedule_reconnect()
-        elif reason_code.is_failure and not self._closing:
-            # Connection failed, also schedule reconnection
+        if not self._closing:
+            if was_connected:
+                _LOGGER.info("MQTT was connected, scheduling reconnection")
             self._schedule_reconnect()
 
     def _create_connection(self, msg: mqtt.MQTTMessage) -> None:
@@ -1179,22 +1189,28 @@ class MqttTransport(_FullTransport, _MqttTransportAbstractor):
 
         assert msg.payload == b"online", "Coding error"
 
-        if self._connected:
-            _LOGGER.info("MQTT device came back online - resuming writing")
-            self._loop.call_soon_threadsafe(self._protocol.resume_writing)
-            return
-
-        _LOGGER.info("MQTT device is online - establishing connection")
-        self._connected = True
-
+        # Set connection details
         self._extra[SZ_ACTIVE_HGI] = msg.topic[-9:]
-
         self._topic_pub = msg.topic + "/tx"
         self._topic_sub = msg.topic + "/rx"
 
-        self.client.subscribe(self._topic_sub, qos=self._mqtt_qos)
+        # Always subscribe to the data topic when we receive "online"
+        result_sub = self.client.subscribe(self._topic_sub, qos=self._mqtt_qos)
+        _LOGGER.info(
+            f"Subscribed to topic_sub: {self._topic_sub}, result: {result_sub}"
+        )
 
-        self._make_connection(gwy_id=msg.topic[-9:])  # type: ignore[arg-type]
+        if self._connected:
+            # Device came back online after being offline
+            _LOGGER.info("MQTT device came back online - resuming writing")
+            self._loop.call_soon_threadsafe(self._protocol.resume_writing)
+        else:
+            # First time connection
+            _LOGGER.info("MQTT device is online - establishing connection")
+            self._make_connection(gwy_id=msg.topic[-9:])  # type: ignore[arg-type]
+
+        # Always set connected to True after handling "online" message
+        self._connected = True
 
     # NOTE: self._frame_read() invoked from here
     def _on_message(
@@ -1224,9 +1240,7 @@ class MqttTransport(_FullTransport, _MqttTransportAbstractor):
             # BUG: using create task (self._loop.ct() & asyncio.ct()) causes the
             # BUG: event look to close early
             elif msg.payload == b"online":
-                _LOGGER.info(
-                    f"{self}: the MQTT device is online: {self._topic_sub[:-3]}"
-                )
+                _LOGGER.info(f"{self}: the MQTT device is online: {msg.topic}")
                 self._create_connection(msg)
 
             return
