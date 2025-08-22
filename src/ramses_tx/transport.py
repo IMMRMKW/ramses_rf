@@ -1038,6 +1038,11 @@ class MqttTransport(_FullTransport, _MqttTransportAbstractor):
 
         super().__init__(*args, **kwargs)
 
+        # Log fork identification
+        _LOGGER.info(
+            "RAMSES RF MQTT Transport - IMMRMKW Fork with enhanced MQTT reliability"
+        )
+
         self._username = unquote(self._broker_url.username or "")
         self._password = unquote(self._broker_url.password or "")
 
