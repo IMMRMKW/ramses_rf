@@ -52,7 +52,18 @@ from typing import TYPE_CHECKING, Any, Final, TypeAlias
 from urllib.parse import parse_qs, unquote, urlparse
 
 from paho.mqtt import MQTTException, client as mqtt
-from paho.mqtt.enums import CallbackAPIVersion
+
+try:  # paho-mqtt >= 2.0
+    from paho.mqtt.enums import (
+        CallbackAPIVersion,  # type: ignore[import-not-found, import-untyped]
+    )
+except Exception:  # pragma: no cover - fallback for older versions
+    try:
+        from paho.mqtt.client import (
+            CallbackAPIVersion,  # type: ignore[import-not-found, import-untyped]
+        )
+    except Exception:  # last resort: define a sentinel so code still runs
+        CallbackAPIVersion = None  # type: ignore[assignment]
 from serial import (  # type: ignore[import-untyped]
     Serial,
     SerialException,
@@ -1033,6 +1044,11 @@ class MqttTransport(_FullTransport, _MqttTransportAbstractor):
         self._topic_base = validate_topic_path(self._broker_url.path)
         self._topic_pub = ""
         self._topic_sub = ""
+        # Wildcard data topic (will capture all gateway /rx packets regardless of 'online')
+        # e.g. base: RAMSES/GATEWAY/+  -> data_wildcard: RAMSES/GATEWAY/+/rx
+        self._topic_data_wildcard = (
+            f"{self._topic_base}/rx" if self._topic_base.endswith("+") else ""
+        )
 
         self._mqtt_qos = int(parse_qs(self._broker_url.query).get("qos", ["0"])[0])
 
@@ -1053,9 +1069,12 @@ class MqttTransport(_FullTransport, _MqttTransportAbstractor):
         self._num_tokens: float = self._MAX_TOKENS * 2
 
         # instantiate a paho mqtt client
-        self.client = mqtt.Client(
-            protocol=mqtt.MQTTv5, callback_api_version=CallbackAPIVersion.VERSION2
-        )
+        if CallbackAPIVersion is not None and hasattr(CallbackAPIVersion, "VERSION2"):
+            self.client = mqtt.Client(
+                protocol=mqtt.MQTTv5, callback_api_version=CallbackAPIVersion.VERSION2
+            )
+        else:  # Older paho versions
+            self.client = mqtt.Client(protocol=mqtt.MQTTv5)
         self.client.on_connect = self._on_connect
         self.client.on_connect_fail = self._on_connect_fail
         self.client.on_disconnect = self._on_disconnect
@@ -1135,16 +1154,26 @@ class MqttTransport(_FullTransport, _MqttTransportAbstractor):
         self._current_reconnect_interval = self._reconnect_interval
 
         # Reset connection state and cancel any pending reconnect task
-        self._connected = False  # Always reset until "online" is received
+        # If we already know the data topic (reconnect case), allow Tx immediately
+        self._connected = bool(self._topic_sub)  # don't block Tx if we retained topic
         if self._reconnect_task:
             self._reconnect_task.cancel()
             self._reconnect_task = None
 
-        # Always subscribe to base topic for "online" message
+        # Always subscribe to base topic for "online"/"offline" messages
         result = self.client.subscribe(self._topic_base)
         _LOGGER.info(f"Subscribed to topic_base: {self._topic_base}, result: {result}")
 
-        # If we already know the data topic, subscribe to it as well (reconnect case)
+        # Always subscribe to wildcard data topic (captures /rx irrespective of 'online')
+        if self._topic_data_wildcard:
+            result_wild = self.client.subscribe(
+                self._topic_data_wildcard, qos=self._mqtt_qos
+            )
+            _LOGGER.info(
+                f"Subscribed to topic_data_wildcard: {self._topic_data_wildcard}, result: {result_wild}"
+            )
+
+        # If we already know the dedicated data topic, (re)subscribe explicitly (idempotent)
         if self._topic_sub:
             result_sub = self.client.subscribe(self._topic_sub, qos=self._mqtt_qos)
             _LOGGER.info(
@@ -1188,13 +1217,12 @@ class MqttTransport(_FullTransport, _MqttTransportAbstractor):
         # _LOGGER.error("Mqtt._create_connection(%s)", msg)
 
         assert msg.payload == b"online", "Coding error"
-
-        # Set connection details
+        # Set/refresh connection details
         self._extra[SZ_ACTIVE_HGI] = msg.topic[-9:]
         self._topic_pub = msg.topic + "/tx"
         self._topic_sub = msg.topic + "/rx"
 
-        # Always subscribe to the data topic when we receive "online"
+        # Always subscribe to the data topic when we receive "online" (idempotent)
         result_sub = self.client.subscribe(self._topic_sub, qos=self._mqtt_qos)
         _LOGGER.info(
             f"Subscribed to topic_sub: {self._topic_sub}, result: {result_sub}"
@@ -1209,7 +1237,7 @@ class MqttTransport(_FullTransport, _MqttTransportAbstractor):
             _LOGGER.info("MQTT device is online - establishing connection")
             self._make_connection(gwy_id=msg.topic[-9:])  # type: ignore[arg-type]
 
-        # Always set connected to True after handling "online" message
+        # Mark device online (Tx enabled)
         self._connected = True
 
     # NOTE: self._frame_read() invoked from here
@@ -1237,13 +1265,29 @@ class MqttTransport(_FullTransport, _MqttTransportAbstractor):
                 self._connected = False
                 self._protocol.pause_writing()
 
-            # BUG: using create task (self._loop.ct() & asyncio.ct()) causes the
-            # BUG: event look to close early
             elif msg.payload == b"online":
                 _LOGGER.info(f"{self}: the MQTT device is online: {msg.topic}")
                 self._create_connection(msg)
 
             return
+
+        # If we got here we have a /rx data packet. If we missed 'online', derive topics now.
+        if not self._topic_sub:
+            # msg.topic example: RAMSES/GATEWAY/18:123456/rx
+            base_topic = msg.topic[:-3]  # strip '/rx'
+            if base_topic.count("/") >= 2:  # heuristic check
+                self._topic_sub = base_topic + "/rx"
+                self._topic_pub = base_topic + "/tx"
+                gwy_id = base_topic.split("/")[-1]
+                if self._extra.get(SZ_ACTIVE_HGI) is None:
+                    self._extra[SZ_ACTIVE_HGI] = gwy_id
+                # Ensure protocol connection_made was invoked at least once
+                if not self._connected:
+                    _LOGGER.info(
+                        f"{self}: establishing connection from first /rx (gateway={gwy_id})"
+                    )
+                    self._make_connection(gwy_id=gwy_id)  # type: ignore[arg-type]
+                self._connected = True
 
         try:
             payload = json.loads(msg.payload)
