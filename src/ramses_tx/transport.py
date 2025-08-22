@@ -1154,11 +1154,22 @@ class MqttTransport(_FullTransport, _MqttTransportAbstractor):
         self._current_reconnect_interval = self._reconnect_interval
 
         # Reset connection state and cancel any pending reconnect task
-        # If we already know the data topic (reconnect case), allow Tx immediately
-        self._connected = bool(self._topic_sub)  # don't block Tx if we retained topic
         if self._reconnect_task:
             self._reconnect_task.cancel()
             self._reconnect_task = None
+
+        # If we already know the topics (reconnect case), enable Tx and ensure protocol connection
+        if self._topic_sub and self._topic_pub:
+            self._connected = True
+            # Make sure protocol connection is established if we have gateway ID
+            if self._extra.get(SZ_ACTIVE_HGI):
+                _LOGGER.info(
+                    "MQTT reconnected with known gateway, re-establishing protocol connection"
+                )
+                self._make_connection(gwy_id=self._extra[SZ_ACTIVE_HGI])  # type: ignore[arg-type]
+                _LOGGER.info(
+                    f"MQTT reconnect: _connected={self._connected}, pub_topic={self._topic_pub}"
+                )
 
         # Always subscribe to base topic for "online"/"offline" messages
         result = self.client.subscribe(self._topic_base)
@@ -1171,6 +1182,10 @@ class MqttTransport(_FullTransport, _MqttTransportAbstractor):
             )
             _LOGGER.info(
                 f"Subscribed to topic_data_wildcard: {self._topic_data_wildcard}, result: {result_wild}"
+            )
+        else:
+            _LOGGER.warning(
+                "No wildcard data topic configured - may miss messages after reconnect"
             )
 
         # If we already know the dedicated data topic, (re)subscribe explicitly (idempotent)
@@ -1279,15 +1294,17 @@ class MqttTransport(_FullTransport, _MqttTransportAbstractor):
                 self._topic_sub = base_topic + "/rx"
                 self._topic_pub = base_topic + "/tx"
                 gwy_id = base_topic.split("/")[-1]
-                if self._extra.get(SZ_ACTIVE_HGI) is None:
-                    self._extra[SZ_ACTIVE_HGI] = gwy_id
+                self._extra[SZ_ACTIVE_HGI] = gwy_id
+
                 # Ensure protocol connection_made was invoked at least once
-                if not self._connected:
-                    _LOGGER.info(
-                        f"{self}: establishing connection from first /rx (gateway={gwy_id})"
-                    )
-                    self._make_connection(gwy_id=gwy_id)  # type: ignore[arg-type]
+                _LOGGER.info(
+                    f"{self}: establishing connection from first /rx (gateway={gwy_id})"
+                )
+                self._make_connection(gwy_id=gwy_id)  # type: ignore[arg-type]
                 self._connected = True
+                _LOGGER.info(
+                    f"{self}: connection established, _connected={self._connected}"
+                )
 
         try:
             payload = json.loads(msg.payload)
@@ -1305,6 +1322,9 @@ class MqttTransport(_FullTransport, _MqttTransportAbstractor):
             )
         # FIXME: convert all dt early, and convert to aware, i.e. dt.now().astimezone()
 
+        _LOGGER.debug(
+            f"Processing RF message: {payload['msg']} (dtm={dtm.isoformat()})"
+        )
         self._frame_read(dtm.isoformat(), _normalise(payload["msg"]))
 
     async def write_frame(self, frame: str, disable_tx_limits: bool = False) -> None:
@@ -1316,9 +1336,13 @@ class MqttTransport(_FullTransport, _MqttTransportAbstractor):
         Protocols call Transport.write_frame(), not Transport.write().
         """
 
-        # Check if we're connected before attempting to write
+        # Check if we're connected and have pub topic before attempting to write
         if not self._connected:
-            _LOGGER.debug(f"{self}: Dropping write - MQTT not connected")
+            _LOGGER.warning(f"{self}: Dropping write - MQTT not connected")
+            return
+
+        if not self._topic_pub:
+            _LOGGER.warning(f"{self}: Dropping write - MQTT pub topic not set")
             return
 
         # top-up the token bucket
@@ -1369,9 +1393,14 @@ class MqttTransport(_FullTransport, _MqttTransportAbstractor):
         # _LOGGER.error("Mqtt._publish(%s)", message)
 
         if not self._connected:
-            _LOGGER.debug("Cannot publish - MQTT not connected")
+            _LOGGER.warning("Cannot publish - MQTT not connected")
             return
 
+        if not self._topic_pub:
+            _LOGGER.warning("Cannot publish - MQTT pub topic not set")
+            return
+
+        _LOGGER.debug(f"Publishing to {self._topic_pub}: {payload}")
         info: mqtt.MQTTMessageInfo = self.client.publish(
             self._topic_pub, payload=payload, qos=self._mqtt_qos
         )
