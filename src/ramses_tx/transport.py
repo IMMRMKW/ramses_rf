@@ -1079,6 +1079,7 @@ class MqttTransport(_FullTransport, _MqttTransportAbstractor):
         self.client.on_connect_fail = self._on_connect_fail
         self.client.on_disconnect = self._on_disconnect
         self.client.on_message = self._on_message
+        self.client.on_subscribe = self._on_subscribe
         self.client.username_pw_set(self._username, self._password)
         # connect to the mqtt server
         self._attempt_connection()
@@ -1172,17 +1173,35 @@ class MqttTransport(_FullTransport, _MqttTransportAbstractor):
                 )
 
         # Always subscribe to base topic for "online"/"offline" messages
-        result = self.client.subscribe(self._topic_base)
-        _LOGGER.info(f"Subscribed to topic_base: {self._topic_base}, result: {result}")
+        try:
+            result = self.client.subscribe(self._topic_base)
+            _LOGGER.info(
+                f"Subscribed to topic_base: {self._topic_base}, result: {result}"
+            )
+            if result and hasattr(result, "rc") and result.rc != mqtt.MQTT_ERR_SUCCESS:
+                _LOGGER.error(f"Base topic subscription failed with code: {result.rc}")
+        except Exception as err:
+            _LOGGER.error(f"Exception during base topic subscription: {err}")
 
         # Always subscribe to wildcard data topic (captures /rx irrespective of 'online')
         if self._topic_data_wildcard:
-            result_wild = self.client.subscribe(
-                self._topic_data_wildcard, qos=self._mqtt_qos
-            )
-            _LOGGER.info(
-                f"Subscribed to topic_data_wildcard: {self._topic_data_wildcard}, result: {result_wild}"
-            )
+            try:
+                result_wild = self.client.subscribe(
+                    self._topic_data_wildcard, qos=self._mqtt_qos
+                )
+                _LOGGER.info(
+                    f"Subscribed to topic_data_wildcard: {self._topic_data_wildcard}, result: {result_wild}"
+                )
+                if (
+                    result_wild
+                    and hasattr(result_wild, "rc")
+                    and result_wild.rc != mqtt.MQTT_ERR_SUCCESS
+                ):
+                    _LOGGER.error(
+                        f"Wildcard subscription failed with code: {result_wild.rc}"
+                    )
+            except Exception as err:
+                _LOGGER.error(f"Exception during wildcard subscription: {err}")
         else:
             _LOGGER.warning(
                 "No wildcard data topic configured - may miss messages after reconnect"
@@ -1190,10 +1209,21 @@ class MqttTransport(_FullTransport, _MqttTransportAbstractor):
 
         # If we already know the dedicated data topic, (re)subscribe explicitly (idempotent)
         if self._topic_sub:
-            result_sub = self.client.subscribe(self._topic_sub, qos=self._mqtt_qos)
-            _LOGGER.info(
-                f"Re-subscribed to topic_sub: {self._topic_sub}, result: {result_sub}"
-            )
+            try:
+                result_sub = self.client.subscribe(self._topic_sub, qos=self._mqtt_qos)
+                _LOGGER.info(
+                    f"Re-subscribed to topic_sub: {self._topic_sub}, result: {result_sub}"
+                )
+                if (
+                    result_sub
+                    and hasattr(result_sub, "rc")
+                    and result_sub.rc != mqtt.MQTT_ERR_SUCCESS
+                ):
+                    _LOGGER.error(
+                        f"Data topic re-subscription failed with code: {result_sub.rc}"
+                    )
+            except Exception as err:
+                _LOGGER.error(f"Exception during data topic re-subscription: {err}")
 
     def _on_connect_fail(
         self,
@@ -1227,6 +1257,28 @@ class MqttTransport(_FullTransport, _MqttTransportAbstractor):
                 _LOGGER.info("MQTT was connected, scheduling reconnection")
             self._schedule_reconnect()
 
+    def _on_subscribe(
+        self,
+        client: mqtt.Client,
+        userdata: Any,
+        mid: int,
+        reason_codes: list[Any],
+        properties: Any | None = None,
+    ) -> None:
+        """Called when a subscription is confirmed."""
+        _LOGGER.info(
+            f"MQTT subscription confirmed: mid={mid}, reason_codes={[rc.getName() if hasattr(rc, 'getName') else rc for rc in reason_codes]}"
+        )
+
+        # Check for any failed subscriptions
+        for i, rc in enumerate(reason_codes):
+            if hasattr(rc, "is_failure") and rc.is_failure:
+                _LOGGER.error(
+                    f"MQTT subscription {i} failed: {rc.getName() if hasattr(rc, 'getName') else rc}"
+                )
+            elif not hasattr(rc, "is_failure") and rc >= 0x80:  # MQTTv3 failure codes
+                _LOGGER.error(f"MQTT subscription {i} failed with code: {rc}")
+
     def _create_connection(self, msg: mqtt.MQTTMessage) -> None:
         """Invoke the Protocols's connection_made() callback MQTT is established."""
         # _LOGGER.error("Mqtt._create_connection(%s)", msg)
@@ -1238,10 +1290,21 @@ class MqttTransport(_FullTransport, _MqttTransportAbstractor):
         self._topic_sub = msg.topic + "/rx"
 
         # Always subscribe to the data topic when we receive "online" (idempotent)
-        result_sub = self.client.subscribe(self._topic_sub, qos=self._mqtt_qos)
-        _LOGGER.info(
-            f"Subscribed to topic_sub: {self._topic_sub}, result: {result_sub}"
-        )
+        try:
+            result_sub = self.client.subscribe(self._topic_sub, qos=self._mqtt_qos)
+            _LOGGER.info(
+                f"Subscribed to topic_sub: {self._topic_sub}, result: {result_sub}"
+            )
+            if (
+                result_sub
+                and hasattr(result_sub, "rc")
+                and result_sub.rc != mqtt.MQTT_ERR_SUCCESS
+            ):
+                _LOGGER.error(
+                    f"Subscription to {self._topic_sub} failed with code: {result_sub.rc}"
+                )
+        except Exception as err:
+            _LOGGER.error(f"Exception during subscription to {self._topic_sub}: {err}")
 
         if self._connected:
             # Device came back online after being offline
