@@ -31,6 +31,12 @@ from .const import (  # noqa: F401, isort: skip, pylint: disable=unused-import
 if TYPE_CHECKING:
     from .const import IndexT, VerbT  # noqa: F401, pylint: disable=unused-import
 
+# Log fork identification at import time
+_LOGGER = logging.getLogger(__name__)
+_LOGGER.warning(
+    "RAMSES RF Library - IMMRMKW Fork v%s with MQTT improvements loaded", VERSION
+)
+
 
 __all__ = [
     "VERSION",
