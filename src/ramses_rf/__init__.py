@@ -33,8 +33,8 @@ if TYPE_CHECKING:
 
 # Log fork identification at import time
 _LOGGER = logging.getLogger(__name__)
-_LOGGER.warning(
-    "RAMSES RF Library - IMMRMKW Fork v%s with MQTT improvements loaded", VERSION
+_LOGGER.error(
+    "🚀🚀🚀 IMMRMKW FORK LOADED - MQTT IMPROVEMENTS ACTIVE 🚀🚀🚀 Version: %s", VERSION
 )
 
 
