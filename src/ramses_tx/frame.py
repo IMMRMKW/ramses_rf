@@ -77,9 +77,25 @@ class Frame:
         self.verb: VerbT = frame[:2]  # type: ignore[assignment]
         self.seqn: str = fields[1]  # . frame[3:6]
         self.code: Code = fields[5]  # type: ignore[assignment]
-        self.len_: str = fields[6]  # . frame[42:45]  FIXME: len_, _len & len(payload)/2
-        self.payload: PayloadT = fields[7]  # frame[46:].split(" ")[0]
-        self._len: int = int(len(self.payload) / 2)
+        self.payload: PayloadT = fields[
+            7
+        ]  # frame[46:].split(" ")[0] - trust the real payload
+
+        # Auto-correct length field to match actual payload (trust the device, not the length field)
+        actual_len = len(self.payload) // 2
+        declared_len_str = fields[6]
+        declared_len = int(declared_len_str)
+
+        if actual_len != declared_len:
+            _LOGGER.warning(
+                f"Auto-correcting length field: {declared_len_str} -> {actual_len:03d} "
+                f"(trusting payload from device: {actual_len} bytes)"
+            )
+            self.len_ = f"{actual_len:03d}"  # Use the real payload length
+        else:
+            self.len_ = declared_len_str  # Keep original if correct
+
+        self._len: int = actual_len  # Always use the real payload length
 
         try:
             self.src, self.dst, *self._addrs = pkt_addrs(  # type: ignore[assignment]
@@ -87,12 +103,6 @@ class Frame:
             )
         except exc.PacketInvalid as err:  # will be: InvalidAddrSetError
             raise exc.PacketInvalid("Bad frame: invalid address set") from err
-
-        if len(self.payload) != int(self.len_) * 2:
-            raise exc.PacketInvalid(
-                f"Bad frame: invalid payload: "
-                f"len({self.payload}) is not int('{self.len_}' * 2))"
-            )
 
         self._ctx_: bool | str = None  # type: ignore[assignment]
         self._hdr_: str = None  # type: ignore[assignment]
@@ -111,8 +121,15 @@ class Frame:
         Raise an exception InvalidPacketError (InvalidAddrSetError) if it is not valid.
         """
 
-        if len(self._frame[46:].split(" ")[0]) != int(self._frame[42:45]) * 2:
-            raise exc.PacketInvalid("Bad frame: Payload length mismatch")
+        # Auto-correct length field validation to match actual payload
+        payload_part = self._frame[46:].split(" ")[0]
+        actual_len = len(payload_part) // 2
+        declared_len = int(self._frame[42:45])
+        if actual_len != declared_len:
+            _LOGGER.warning(
+                f"Auto-correcting frame length in validation: {declared_len:03d} -> {actual_len:03d} "
+                f"(payload has {actual_len} bytes, not {declared_len})"
+            )
 
         try:
             # self.src, self.dst, *self._addrs = pkt_addrs(self._frame[7:36])
@@ -127,9 +144,9 @@ class Frame:
             if addrs[0] == NON_DEV_ADDR:
                 assert self.verb == I_, "wrong verb or dst addr should be present"
             elif addrs[2] == NON_DEV_ADDR:
-                assert self.verb == I_ or src is not dst, (
-                    "wrong verb or dst addr should not be src"
-                )
+                assert (
+                    self.verb == I_ or src is not dst
+                ), "wrong verb or dst addr should not be src"
             elif addrs[0] is addrs[2]:
                 assert self.verb == I_, "wrong verb or dst addr should not be src"
             else:
@@ -214,9 +231,9 @@ class Frame:
         if self._has_array_:
             len_ = CODES_WITH_ARRAYS[self.code][0]
 
-            assert self._len % len_ == 0, (
-                f"{self} < array has length ({self._len}) that is not multiple of {len_}"
-            )
+            assert (
+                self._len % len_ == 0
+            ), f"{self} < array has length ({self._len}) that is not multiple of {len_}"
             assert (
                 self.src.type in (DEV_TYPE_MAP.DTS, DEV_TYPE_MAP.DT2)
                 or self.src == self.dst  # DEX
