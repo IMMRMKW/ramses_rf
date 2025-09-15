@@ -639,7 +639,7 @@ l = r"\d{3}"  # length # noqa: E741
 p = r"([0-9A-F]{2}){1,48}"  # payload
 
 # DEVICE_ID_REGEX = re.compile(f"^{d}$")
-COMMAND_REGEX = re.compile(f"^{v} {r} {d} {d} {d} {c} {l} {p}$")
+COMMAND_REGEX = re.compile(f"^(: )?{v} {r} {d} {d} {d} {c} {l} {p}$")
 MESSAGE_REGEX = re.compile(f"^{r} {v} {r} {d} {d} {d} {c} {l} {p}$")
 
 

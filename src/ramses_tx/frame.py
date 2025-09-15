@@ -72,18 +72,31 @@ class Frame:
         if not COMMAND_REGEX.match(self._frame):
             raise exc.PacketInvalid(f"Bad frame: invalid structure: >>>{frame}<<<")
 
-        fields = frame.lstrip().split(" ")
+        # Don't strip before splitting to preserve prefix for field indexing
+        fields = frame.split(" ")
 
-        self.verb: VerbT = frame[:2]  # type: ignore[assignment]
-        self.seqn: str = fields[1]  # . frame[3:6]
-        self.code: Code = fields[5]  # type: ignore[assignment]
-        self.payload: PayloadT = fields[
-            7
-        ]  # frame[46:].split(" ")[0] - trust the real payload
+        # Handle optional ': ' prefix
+        if frame.startswith(": "):
+            # Skip the ': ' prefix when extracting verb and adjust field indices
+            self.verb: VerbT = frame[2:4]  # type: ignore[assignment]
+            self.seqn: str = fields[2]  # Skip ': ' and verb
+            self.code: Code = fields[6]  # type: ignore[assignment]
+            self.payload: PayloadT = fields[8]  # Adjust for prefix
+        else:
+            # Original format without prefix
+            self.verb: VerbT = frame[:2]  # type: ignore[assignment]
+            self.seqn: str = fields[1]  # . frame[3:6]
+            self.code: Code = fields[5]  # type: ignore[assignment]
+            self.payload: PayloadT = fields[
+                7
+            ]  # frame[46:].split(" ")[0] - trust the real payload
 
         # Auto-correct length field to match actual payload (trust the device, not the length field)
         actual_len = len(self.payload) // 2
-        declared_len_str = fields[6]
+
+        # Get length field index based on prefix
+        len_field_idx = 7 if frame.startswith(": ") else 6
+        declared_len_str = fields[len_field_idx]
         declared_len = int(declared_len_str)
 
         if actual_len != declared_len:
@@ -98,8 +111,10 @@ class Frame:
         self._len: int = actual_len  # Always use the real payload length
 
         try:
+            # Get address field range based on prefix
+            addr_start_idx = 3 if frame.startswith(": ") else 2
             self.src, self.dst, *self._addrs = pkt_addrs(  # type: ignore[assignment]
-                " ".join(fields[i] for i in range(2, 5))  # frame[7:36]
+                " ".join(fields[i] for i in range(addr_start_idx, addr_start_idx + 3))
             )
         except exc.PacketInvalid as err:  # will be: InvalidAddrSetError
             raise exc.PacketInvalid("Bad frame: invalid address set") from err
